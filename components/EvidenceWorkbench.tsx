@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   Alert,
@@ -36,6 +36,7 @@ import {
   AssessmentOutlined,
   AssignmentTurnedInOutlined,
   CheckCircleOutlined,
+  CloudQueueOutlined,
   CloudUploadOutlined,
   DashboardOutlined,
   FactCheckOutlined,
@@ -45,10 +46,13 @@ import {
   NotificationsNoneOutlined,
   RuleOutlined,
   ScienceOutlined,
-  TaskAltOutlined
+  SyncProblemOutlined,
+  TaskAltOutlined,
+  WifiOffOutlined
 } from '@mui/icons-material';
 import { fetchEvidence } from '@/lib/api';
 import { useCarbonStore } from '@/lib/store';
+import SyncCenter from './SyncCenter';
 
 const drawerWidth = 232;
 
@@ -57,17 +61,63 @@ type View = 'overview' | 'verify' | 'issuance';
 export default function EvidenceWorkbench({ initialView }: { initialView: View }) {
   const [view] = useState<View>(initialView);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [syncOpen, setSyncOpen] = useState(false);
   const [recordFilter, setRecordFilter] = useState('全部');
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [correctionValue, setCorrectionValue] = useState('');
   const [correctionReason, setCorrectionReason] = useState('');
-  const { data, isLoading } = useQuery({ queryKey: ['carbon-api'], queryFn: fetchEvidence });
   const store = useCarbonStore();
+  const { data, isLoading } = useQuery({ queryKey: ['carbon-api'], queryFn: fetchEvidence });
+
+  useEffect(() => {
+    if (data) {
+      store.hydrateFromServer(data);
+      // 挂载时若在线，自动续作上次未完成的补交队列
+      if (store.networkMode === 'online') void store.processQueue();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
+
+  useEffect(() => {
+    const goOnline = () => store.setNetworkMode('online');
+    const goOffline = () => store.setNetworkMode('offline');
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const selected = store.records.find((record) => record.id === store.selectedRecordId) ?? store.records[0];
   const visibleRecords = useMemo(() => recordFilter === '全部' ? store.records : store.records.filter((record) => record.status === recordFilter), [recordFilter, store.records]);
   const totalReduction = store.records.reduce((total, record) => total + record.activity * record.factor / (record.unit === 'kWh' ? 1000 : record.unit === 'L' ? 1000 : 1), 0);
   const openFindings = store.findings.filter((item) => item.status !== '已关闭');
-  const allIssuanceChecked = Object.values(store.issuanceChecks).every(Boolean) && openFindings.length === 0;
+  const queueCounts = useMemo(() => ({
+    pending: store.queue.filter((q) => q.status === 'pending').length,
+    submitting: store.queue.filter((q) => q.status === 'submitting').length,
+    failed: store.queue.filter((q) => q.status === 'failed').length,
+    conflict: store.queue.filter((q) => q.status === 'conflict').length,
+    confirmed: store.queue.filter((q) => q.status === 'confirmed').length
+  }), [store.queue]);
+  const queueBlocking = queueCounts.pending + queueCounts.submitting + queueCounts.failed + queueCounts.conflict;
+  const allIssuanceChecked = Object.values(store.issuanceChecks).every(Boolean) && openFindings.length === 0 && queueBlocking === 0;
+  const revisionHistory = store.queue
+    .filter((q) => q.status === 'confirmed' && q.type === 'revision')
+    .map((q) => ({ rev: q.resultRevision ?? 0, actor: '核验员（本机）', note: String(q.payload.reason ?? '修订活动数据'), duplicate: q.duplicate === true }));
+
+  /** 记录在补交队列中的最新状态（各页显示同批结果） */
+  const recordQueueState = (recordId: string) => {
+    const item = store.queue
+      .filter((q) => q.entityId === recordId && q.status !== 'confirmed')
+      .sort((a, b) => b.order - a.order)[0];
+    if (!item) return null;
+    if (item.status === 'conflict') return { label: '冲突待处理', color: 'error' as const };
+    if (item.status === 'failed') return { label: '补交失败', color: 'warning' as const };
+    if (item.status === 'submitting') return { label: '补交中', color: 'info' as const };
+    return { label: '待补交', color: 'default' as const };
+  };
 
   const nav = [
     { id: 'overview', label: '监测期总览', href: '/', icon: DashboardOutlined },
@@ -115,6 +165,23 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
           </Box>
           <Box sx={{ flex: 1 }} />
           <Chip size="small" label={`${openFindings.length} 项发现开放`} sx={{ color: '#ffdda7', borderColor: '#a87935', bgcolor: 'rgba(255,255,255,.05)' }} variant="outlined" />
+          <Tooltip title={store.networkMode === 'online' ? '在线：补交项将按序提交' : '断网：操作留本机，恢复后补交'}>
+            <Chip
+              size="small"
+              icon={store.networkMode === 'online' ? <CloudQueueOutlined sx={{ color: '#9fd4c3 !important' }} /> : <WifiOffOutlined sx={{ color: '#ffdda7 !important' }} />}
+              label={store.networkMode === 'online' ? '在线' : '断网'}
+              color={store.networkMode === 'online' ? 'success' : 'warning'}
+              variant={store.networkMode === 'online' ? 'outlined' : 'filled'}
+              sx={{ color: store.networkMode === 'online' ? '#9fd4c3' : '#5a3a12', borderColor: store.networkMode === 'online' ? '#4d8a77' : 'transparent', bgcolor: store.networkMode === 'online' ? 'rgba(255,255,255,.05)' : '#e1a45d' }}
+            />
+          </Tooltip>
+          <Tooltip title="补交与同步中心">
+            <IconButton color="inherit" onClick={() => setSyncOpen(true)}>
+              <Badge badgeContent={queueCounts.conflict + queueCounts.failed} color="error" max={99}>
+                <CloudQueueOutlined />
+              </Badge>
+            </IconButton>
+          </Tooltip>
           <IconButton color="inherit"><NotificationsNoneOutlined /></IconButton>
           <Avatar sx={{ width: 30, height: 30, bgcolor: '#e1a45d', fontSize: 12 }}>沈</Avatar>
         </Toolbar>
@@ -136,6 +203,24 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
             </Stack>
           </Stack>
           {isLoading && <LinearProgress />}
+
+          <Stack spacing={1} mb={2}>
+            {store.networkMode === 'offline' && (
+              <Alert severity="info" icon={<WifiOffOutlined />}>
+                断网模式：修订、核验、补证与签发确认将先保留在本机，恢复网络后按序补交；重复补交使用同一凭证，不会生成第二版。
+              </Alert>
+            )}
+            {queueCounts.conflict > 0 && (
+              <Alert severity="error" action={<Button color="inherit" size="small" onClick={() => setSyncOpen(true)}>去处理</Button>}>
+                {queueCounts.conflict} 项补交与服务端新版本冲突，待核验员处理；处理前不计入签发准备，并继续挡住签发检查。
+              </Alert>
+            )}
+            {queueCounts.failed > 0 && (
+              <Alert severity="warning" action={<Button color="inherit" size="small" onClick={() => void store.processQueue()}>重试</Button>}>
+                {queueCounts.failed} 项补交失败，将从已确认记录继续补交。
+              </Alert>
+            )}
+          </Stack>
 
           {view === 'overview' && (
             <>
@@ -166,7 +251,10 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
                           <Typography fontSize={12}>{record.factor} <small>{record.factorUnit}</small></Typography>
                           <Typography fontSize={11}>{record.timeRange}</Typography>
                           <Typography fontSize={12}>{record.evidenceCount} 项</Typography>
-                          <Chip size="small" label={record.status} color={record.status === '已核验' ? 'success' : record.status === '需补证' ? 'warning' : 'default'} variant={record.status === '已核验' ? 'filled' : 'outlined'} />
+                          <Stack direction="row" spacing={.5} alignItems="center" flexWrap="wrap" useFlexGap>
+                            <Chip size="small" label={record.status} color={record.status === '已核验' ? 'success' : record.status === '需补证' ? 'warning' : 'default'} variant={record.status === '已核验' ? 'filled' : 'outlined'} />
+                            {(() => { const q = recordQueueState(record.id); return q ? <Chip size="small" label={q.label} color={q.color} variant="outlined" sx={{ height: 20, fontSize: 10 }} /> : null; })()}
+                          </Stack>
                         </Box>
                       ))}
                     </Box>
@@ -196,7 +284,7 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
                 {store.records.map((record) => (
                   <Box key={record.id} sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '22px minmax(210px, 1.3fr) .8fr .8fr .8fr auto' }, alignItems: 'center', gap: 1.2, px: 1.6, py: 1.3, borderTop: '1px solid #edf0ef' }}>
                     <input type="checkbox" checked={store.sampledIds.includes(record.id)} onChange={() => store.toggleSample(record.id)} aria-label={`抽样 ${record.id}`} />
-                    <Box><Typography fontSize={12.5} fontWeight={700}>{record.source}</Typography><Typography fontSize={10} color="text.secondary">{record.id} · 证据 {record.evidenceCount} 份</Typography></Box>
+                    <Box><Typography fontSize={12.5} fontWeight={700}>{record.source}</Typography><Typography fontSize={10} color="text.secondary">{record.id} · 证据 {record.evidenceCount} 份</Typography>{(() => { const q = recordQueueState(record.id); return q ? <Chip size="small" label={q.label} color={q.color} variant="outlined" sx={{ mt: .4, height: 18, fontSize: 10 }} /> : null; })()}</Box>
                     <Box><Typography variant="caption" color="text.secondary">来源</Typography><Typography fontSize={11}>原始计量记录</Typography></Box>
                     <Box><Typography variant="caption" color="text.secondary">单位</Typography><Typography fontSize={11}>{record.unit} / {record.factorUnit}</Typography></Box>
                     <Box><Typography variant="caption" color="text.secondary">时间范围</Typography><Typography fontSize={11}>{record.timeRange.includes('至') ? '已覆盖整期' : '待检查'}</Typography></Box>
@@ -205,7 +293,25 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
                 ))}
               </Card>
               <Stack spacing={1.5}>
-                <Card elevation={0} variant="outlined"><CardContent><Typography fontWeight={800} fontSize={14} mb={1.3}>发现项闭环</Typography>{store.findings.map((finding) => <Box key={finding.id} sx={{ borderTop: '1px solid #edf0ef', py: 1.2 }}><Stack direction="row" justifyContent="space-between"><Typography fontSize={12} fontWeight={700}>{finding.title}</Typography><Chip size="small" label={finding.status} color={finding.status === '已关闭' ? 'success' : finding.status === '补证中' ? 'warning' : 'error'} /></Stack><Typography fontSize={10.5} color="text.secondary" mt={.5}>{finding.detail}</Typography><Stack direction="row" spacing={.7} mt={1}><Button size="small" disabled={finding.status === '已关闭'} onClick={() => store.requestEvidence(finding.id)}>发起补证</Button><Button size="small" disabled={finding.status === '已关闭'} onClick={() => store.closeFinding(finding.id)}>关闭</Button></Stack></Box>)}</CardContent></Card>
+                <Card elevation={0} variant="outlined"><CardContent><Typography fontWeight={800} fontSize={14} mb={1.3}>发现项闭环</Typography>{store.findings.map((finding) => {
+                  const findingConflict = store.queue.some((q) => q.entityId === finding.id && q.status === 'conflict');
+                  const findingFailed = store.queue.some((q) => q.entityId === finding.id && q.status === 'failed');
+                  return (
+                    <Box key={finding.id} sx={{ borderTop: '1px solid #edf0ef', py: 1.2 }}>
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                        <Typography fontSize={12} fontWeight={700}>{finding.title}</Typography>
+                        <Stack direction="row" spacing={.5} flexWrap="wrap" useFlexGap justifyContent="flex-end">
+                          {findingConflict && <Chip size="small" color="error" label="补交冲突待处理" sx={{ height: 20, fontSize: 11 }} />}
+                          {findingFailed && <Chip size="small" color="warning" label="补交失败" sx={{ height: 20, fontSize: 11 }} />}
+                          <Chip size="small" label={finding.status} color={finding.status === '已关闭' ? 'success' : finding.status === '补证中' ? 'warning' : 'error'} />
+                        </Stack>
+                      </Stack>
+                      <Typography fontSize={10.5} color="text.secondary" mt={.5}>{finding.detail}</Typography>
+                      {findingConflict && <Alert severity="error" sx={{ mt: .8, py: .2, '& .MuiAlert-icon': { mr: .3, fontSize: 17 } }}>该发现项的补交与服务端新版本冲突，核验员处理前继续挡住签发检查。</Alert>}
+                      <Stack direction="row" spacing={.7} mt={1}><Button size="small" disabled={finding.status === '已关闭'} onClick={() => store.requestEvidence(finding.id)}>发起补证</Button><Button size="small" disabled={finding.status === '已关闭'} onClick={() => store.closeFinding(finding.id)}>关闭</Button></Stack>
+                    </Box>
+                  );
+                })}</CardContent></Card>
                 <Alert severity="info">任何数据修订都会生成新版本，原始提交和计算链不会被覆盖。</Alert>
               </Stack>
             </Box>
@@ -216,25 +322,48 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
               <Card elevation={0} variant="outlined">
                 <CardContent>
                   <Typography fontWeight={800} fontSize={14}>签发前完整性检查</Typography>
-                  <Typography fontSize={11} color="text.secondary" mb={1.5}>所有门禁项必须确认，开放发现项必须关闭。</Typography>
+                  <Typography fontSize={11} color="text.secondary" mb={1.5}>所有门禁项必须确认，开放发现项必须关闭，补交项须全部确认。</Typography>
                   {[
                     { id: 'evidence', title: '证据与计算链完整', detail: '活动数据、排放因子、来源证据与修订说明可追溯。' },
                     { id: 'calculation', title: '计算过程复核通过', detail: '单位和换算系数一致，关键公式由核验员确认。' },
                     { id: 'revisions', title: '历史修订未覆盖原始数据', detail: '所有数据均有版本号和修订原因。' },
                     { id: 'methodology', title: '方法学与监测计划匹配', detail: `项目采用 ${data?.project.methodology ?? 'CMS-052-V01'}。` }
                   ].map((item) => <Box key={item.id} component="label" sx={{ display: 'flex', gap: 1.3, alignItems: 'flex-start', borderTop: '1px solid #edf0ef', py: 1.5, cursor: 'pointer' }}><input type="checkbox" checked={store.issuanceChecks[item.id]} onChange={() => store.toggleIssuanceCheck(item.id)} /><Box><Typography fontSize={12.5} fontWeight={700}>{item.title}</Typography><Typography fontSize={10.5} color="text.secondary" mt={.4}>{item.detail}</Typography></Box></Box>)}
+                  <Box sx={{ display: 'flex', gap: 1.3, alignItems: 'flex-start', borderTop: '1px solid #edf0ef', py: 1.5 }}>
+                    {queueBlocking === 0 ? <CheckCircleOutlined color="success" sx={{ mt: .2 }} /> : <SyncProblemOutlined color="error" sx={{ mt: .2 }} />}
+                    <Box>
+                      <Typography fontSize={12.5} fontWeight={700}>补交项全部确认后才计入签发准备</Typography>
+                      <Typography fontSize={10.5} color="text.secondary" mt={.4}>
+                        {queueBlocking === 0
+                          ? '本批补交已全部确认，无冲突、无失败、无待补交。'
+                          : `待补交 ${queueCounts.pending + queueCounts.submitting} · 失败 ${queueCounts.failed} · 冲突 ${queueCounts.conflict}；冲突项须核验员在同步中心处理后才计入。`}
+                      </Typography>
+                    </Box>
+                  </Box>
                 </CardContent>
               </Card>
               <Stack spacing={1.5}>
-                <Card elevation={0} variant="outlined"><CardContent><Typography fontWeight={800} fontSize={14}>签发就绪度</Typography><Stack direction="row" alignItems="baseline" spacing={1} mt={1}><Typography variant="h4" fontWeight={850}>{Math.round(Object.values(store.issuanceChecks).filter(Boolean).length / 4 * 70 + (openFindings.length === 0 ? 30 : 0))}%</Typography><Typography fontSize={11} color="text.secondary">完成度</Typography></Stack><LinearProgress variant="determinate" value={Object.values(store.issuanceChecks).filter(Boolean).length / 4 * 100} sx={{ height: 7, borderRadius: 3, mt: 1 }} /><Typography fontSize={11} color="text.secondary" mt={1.2}>还有 {openFindings.length} 个开放发现项。</Typography></CardContent></Card>
-                <Card elevation={0} variant="outlined"><CardContent><Stack direction="row" justifyContent="space-between"><Typography fontWeight={800} fontSize={14}>版本与核验意见</Typography><IconButton size="small"><MoreHorizOutlined /></IconButton></Stack>{[['V4', '韩跃', '修订柴油活动数据并补充测试运行说明'], ['V3', '沈楠', '要求补充流量计校准证据'], ['V2', '徐璐', '统一电量单位并附原始记录']].map((item) => <Stack key={item[0]} direction="row" spacing={1.2} sx={{ borderTop: '1px solid #edf0ef', py: 1.2 }}><Chip size="small" label={item[0]} /><Box><Typography fontSize={11.5} fontWeight={700}>{item[1]}</Typography><Typography fontSize={10.5} color="text.secondary">{item[2]}</Typography></Box></Stack>)}</CardContent></Card>
-                <Alert severity={allIssuanceChecked ? 'success' : 'warning'}>{allIssuanceChecked ? '全部门禁已完成，可提交签发准备。' : '关闭开放发现项并完成所有检查后可提交。'}</Alert>
+                <Card elevation={0} variant="outlined"><CardContent><Typography fontWeight={800} fontSize={14}>签发就绪度</Typography><Stack direction="row" alignItems="baseline" spacing={1} mt={1}><Typography variant="h4" fontWeight={850}>{Math.round(Object.values(store.issuanceChecks).filter(Boolean).length / 4 * 70 + (openFindings.length === 0 ? 30 : 0))}%</Typography><Typography fontSize={11} color="text.secondary">完成度</Typography></Stack><LinearProgress variant="determinate" value={Object.values(store.issuanceChecks).filter(Boolean).length / 4 * 100} sx={{ height: 7, borderRadius: 3, mt: 1 }} /><Typography fontSize={11} color="text.secondary" mt={1.2}>还有 {openFindings.length} 个开放发现项{queueBlocking > 0 ? `，${queueBlocking} 项补交未确认` : ''}。</Typography></CardContent></Card>
+                <Card elevation={0} variant="outlined"><CardContent><Stack direction="row" justifyContent="space-between"><Typography fontWeight={800} fontSize={14}>版本与核验意见</Typography><IconButton size="small" onClick={() => setSyncOpen(true)}><MoreHorizOutlined /></IconButton></Stack>
+                  {revisionHistory.map((entry) => (
+                    <Stack key={`q-${entry.rev}`} direction="row" spacing={1.2} sx={{ borderTop: '1px solid #edf0ef', py: 1.2 }}>
+                      <Chip size="small" label={`V${entry.rev}`} color="success" />
+                      <Box>
+                        <Typography fontSize={11.5} fontWeight={700}>{entry.actor} <Chip size="small" label="本批补交" color="primary" variant="outlined" sx={{ height: 18, fontSize: 10, ml: .5 }} />{entry.duplicate && <Typography component="span" variant="caption" color="text.secondary"> · 重复补交未生成第二版</Typography>}</Typography>
+                        <Typography fontSize={10.5} color="text.secondary">{entry.note}</Typography>
+                      </Box>
+                    </Stack>
+                  ))}
+                  {[['V4', '韩跃', '修订柴油活动数据并补充测试运行说明'], ['V3', '沈楠', '要求补充流量计校准证据'], ['V2', '徐璐', '统一电量单位并附原始记录']].map((item) => <Stack key={item[0]} direction="row" spacing={1.2} sx={{ borderTop: '1px solid #edf0ef', py: 1.2 }}><Chip size="small" label={item[0]} /><Box><Typography fontSize={11.5} fontWeight={700}>{item[1]}</Typography><Typography fontSize={10.5} color="text.secondary">{item[2]}</Typography></Box></Stack>)}
+                </CardContent></Card>
+                <Alert severity={allIssuanceChecked ? 'success' : 'warning'}>{allIssuanceChecked ? '全部门禁已完成，本批补交已确认，可提交签发准备。' : '关闭开放发现项、处理冲突补交并完成所有检查后可提交。'}</Alert>
               </Stack>
             </Box>
           )}
         </Box>
       </Box>
 
+      <SyncCenter open={syncOpen} onClose={() => setSyncOpen(false)} />
       <Tooltip title="核验记录会写入审计链"><Button sx={{ position: 'fixed', bottom: 18, right: 18, zIndex: 5 }} variant="contained" size="small" startIcon={<FactCheckOutlined />}>操作均留痕</Button></Tooltip>
       {correctionOpen && (
         <Box sx={{ position: 'fixed', inset: 0, zIndex: 60, bgcolor: 'rgba(15,25,22,.4)', display: 'grid', placeItems: 'center', p: 2 }} onMouseDown={() => setCorrectionOpen(false)}>
