@@ -27,7 +27,15 @@ export const evidenceResponseSchema = z.object({
     anomaly: z.number(),
     owner: z.string(),
     status: z.enum(['待核验', '复核中', '已核验', '需补证']),
-    revision: z.number()
+    revision: z.number(),
+    lastEditor: z.string().optional(),
+    lastReason: z.string().optional()
+  })),
+  findings: z.array(z.object({
+    id: z.string(),
+    status: z.enum(['开放', '补证中', '已关闭']),
+    rev: z.number(),
+    lastNote: z.string().optional()
   }))
 });
 
